@@ -43,18 +43,20 @@ def upload_to_s3(obj, dst):
 
 class Trainer:
 
-    def __init__(self, trainer_config: TrainerConfig, model, optimizer, train_dataset, test_dataset=None):
+    def __init__(self, global_rank: int, trainer_config: TrainerConfig, model, optimizer, train_dataset, test_dataset=None):
         self.config = trainer_config
         # set torchrun variables
-        self.local_rank = int(os.environ["LOCAL_RANK"])
-        self.global_rank = int(os.environ["RANK"])  
+        self.global_rank = global_rank
+        self.local_rank = self.global_rank % 8
         # data stuff
         self.train_dataset = train_dataset
         self.train_loader = self._prepare_dataloader(train_dataset)
         self.test_loader = self._prepare_dataloader(test_dataset) if test_dataset else None
         # initialize train states
         self.epochs_run = 0
-        self.model = model.to(self.local_rank)
+        self.model = model
+        if torch.cuda.is_available():
+            self.model = self.model.to(self.local_rank)
         self.optimizer = optimizer        
         self.save_every = self.config.save_every
         if self.config.use_amp:
@@ -64,7 +66,8 @@ class Trainer:
             self.config.snapshot_path = "snapshot.pt"
         self._load_snapshot()
         # wrap with DDP. this step will synch model across all the processes.
-        self.model = DDP(self.model, device_ids=[self.local_rank])
+        device_ids = [self.local_rank] if torch.cuda.is_available() else None
+        self.model = DDP(module=self.model, device_ids=device_ids)
         
     def _prepare_dataloader(self, dataset: Dataset):
         return DataLoader(
@@ -114,8 +117,9 @@ class Trainer:
         dataloader.sampler.set_epoch(epoch)
         for iter, (source, targets) in enumerate(dataloader):
             step_type = "Train" if train else "Eval"
-            source = source.to(self.local_rank)
-            targets = targets.to(self.local_rank)
+            if torch.cuda.is_available():
+                source = source.to(self.local_rank)
+                targets = targets.to(self.local_rank)
             batch_loss = self._run_batch(source, targets, train)
             if iter % 100 == 0:
                 print(f"[GPU{self.global_rank}] Epoch {epoch} | Iter {iter} | {step_type} Loss {batch_loss:.5f}")
