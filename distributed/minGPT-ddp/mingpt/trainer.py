@@ -5,7 +5,7 @@ so nothing in this file really has anything to do with GPT specifically.
 
 from dataclasses import dataclass, asdict
 from collections import OrderedDict
-from typing import Optional, Any, Dict
+from typing import Optional, Any, Dict, Union
 import os
 
 import torch
@@ -18,6 +18,9 @@ from torch.distributed.checkpoint.filesystem import FileSystemWriter
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.profiler import profile, record_function
+from torch.distributed._state_dict_utils import (
+    _offload_state_dict_to_cpu,
+)
 
 from urllib.parse import urlparse
 import fsspec
@@ -82,6 +85,38 @@ class AppState(Stateful):
         self.epoch = metadata["epoch"]
         self.step = metadata["step"]
 
+class CustomWriter(FileSystemWriter):
+    def __init__(
+        self,
+        path: Union[str, os.PathLike],
+        single_file_per_rank: bool = True,
+        sync_files: bool = True,
+        thread_count: int = 1,
+        per_thread_copy_ahead: int = 10_000_000,
+        cache_staged_state_dict: bool = False,
+        overwrite: bool = True,
+    ) -> None:
+        super().__init__(
+            path=path,
+            single_file_per_rank=single_file_per_rank,
+            sync_files=sync_files,
+            thread_count=thread_count,
+            per_thread_copy_ahead=per_thread_copy_ahead,
+            cache_staged_state_dict=cache_staged_state_dict,
+            overwrite=overwrite,
+        )
+        self.cache_staged_state_dict = cache_staged_state_dict
+
+    def stage(self, state_dict):
+        if not self.cache_staged_state_dict:
+            return _offload_state_dict_to_cpu(state_dict, type_check=self.type_check)
+
+        self.old_state_dict_cache = self.state_dict_cache
+        self.state_dict_cache = _offload_state_dict_to_cpu(state_dict)
+        self.old_state_dict_cache = None
+
+        return self.state_dict_cache
+
 class Trainer:
 
     def __init__(self, global_rank: int, trainer_config: TrainerConfig, model, optimizer, train_dataset, test_dataset=None, profiler=None):
@@ -101,7 +136,7 @@ class Trainer:
             self.scaler = torch.cuda.amp.GradScaler()
         # load snapshot if available. only necessary on the first node.
         self.app_state = AppState(self.model, self.optimizer)
-        self.writer = FileSystemWriter(path=CHECKPOINT_DIR, cache_staged_state_dict=True)
+        self.writer = CustomWriter(path=CHECKPOINT_DIR, cache_staged_state_dict=True)
         self._load_checkpoint()
         # initialize train states
         # wrap with DDP. this step will synch model across all the processes.
@@ -152,7 +187,6 @@ class Trainer:
             return 
 
         print(f"Resuming training from checkpoint at epoch {self.app_state.epoch} step {self.app_state.step}")
-
 
     def _run_batch(self, source, targets, train: bool = True) -> float:
         with torch.set_grad_enabled(train), torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=(self.config.use_amp)):
@@ -205,7 +239,6 @@ class Trainer:
                 if self.checkpoint_future is None or self.checkpoint_future.result():
                     self._save_checkpoint(epoch, step)
 
-
     def train(self):
         for epoch in range(int(self.app_state.epoch), self.config.max_epochs):
             self.app_state.epoch = epoch
@@ -213,5 +246,3 @@ class Trainer:
             # eval run
             if self.test_loader:
                 self._run_epoch(epoch, self.test_loader, train=False)
-
-            
