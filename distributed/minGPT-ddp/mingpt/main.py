@@ -1,5 +1,6 @@
 import os
 import socket
+from datetime import datetime
 import torch
 from torch.utils.data import random_split
 from torch.distributed import init_process_group, destroy_process_group
@@ -10,10 +11,11 @@ from omegaconf import DictConfig
 import hydra
 
 import torch.multiprocessing as mp
+from torch.profiler import profile, schedule, tensorboard_trace_handler
 
 
 def ddp_setup(global_rank: int, world_size: int):
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    backend = "cpu:gloo,cuda:nccl" if torch.cuda.is_available() else "gloo"
     init_process_group(backend=backend, rank=global_rank, world_size=world_size)
     if torch.cuda.is_available():
         torch.cuda.set_device(global_rank % 8)
@@ -56,9 +58,30 @@ def train_process(
 ):
     ddp_setup(global_rank, world_size)
 
+    if trainer_cfg.profile and global_rank == 0:
+        profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=1, warmup=1, active=5, repeat=3  # Customize profiling timing
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('./logs/minGPT'),
+            record_shapes=True,
+            profile_memory=True,
+            with_flops=True,
+            with_modules=True,
+        )
+        profiler.start()
+    else:
+        profiler = None
     model, optimizer, train_data, test_data = get_train_objs(gpt_cfg, opt_cfg, data_cfg)
-    trainer = Trainer(global_rank, trainer_cfg, model, optimizer, train_data, test_data)
+    trainer = Trainer(global_rank, trainer_cfg, model, optimizer, train_data, test_data, profiler)
     trainer.train()
+
+    if global_rank == 0:
+        profiler.stop()
 
     destroy_process_group()
 
