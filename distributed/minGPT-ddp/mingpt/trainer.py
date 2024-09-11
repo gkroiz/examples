@@ -3,10 +3,13 @@ Simple training loop; Boilerplate that could apply to any arbitrary neural netwo
 so nothing in this file really has anything to do with GPT specifically.
 """
 
-from dataclasses import dataclass, asdict
-from collections import OrderedDict
-from typing import Optional, Any, Dict, Union
+from dataclasses import dataclass
+from typing import Optional
 import os
+import io
+import glob
+import time
+from datetime import datetime
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -14,21 +17,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 import torch.distributed.checkpoint as dcp
-from torch.distributed.checkpoint.filesystem import FileSystemWriter
-from torch.distributed.checkpoint.stateful import Stateful
-from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.profiler import profile, record_function
-from torch.distributed._state_dict_utils import (
-    _offload_state_dict_to_cpu,
-)
-
-from urllib.parse import urlparse
-import fsspec
-import io
-import glob
-import json
-import time
-from datetime import datetime
+from state_management import AppState, CustomWriter
 
 CHECKPOINT_DIR = "checkpoint/"
 
@@ -44,107 +34,45 @@ class TrainerConfig:
     profile: bool = None
     async_ckpts: bool = None
 
-class AppState(Stateful):
-    """This is a useful wrapper for checkpointing the Application State. Since this object is compliant
-    with the Stateful protocol, DCP will automatically call state_dict/load_stat_dict as needed in the
-    dcp.save/load APIs.
-
-    Note: We take advantage of this wrapper to hande calling distributed state dict methods on the model
-    and optimizer.
-    """
-
-    def __init__(self, model, optimizer=None, epoch=0, step=0):
-        self.model = model
-        self.optimizer = optimizer
-        self.epoch = epoch
-        self.step = step
-
-    def state_dict(self):
-        # this line automatically manages FSDP FQN's, as well as sets the default state dict type to FSDP.SHARDED_STATE_DICT
-        model_state_dict, optimizer_state_dict = get_state_dict(self.model, self.optimizer)
-        return {
-            "model": model_state_dict,
-            "optim": optimizer_state_dict,
-            "metadata": self.metadata()
-        }
-
-    def load_state_dict(self, state_dict):
-        # sets our state dicts on the model and optimizer, now that we've loaded
-        set_state_dict(
-            self.model,
-            self.optimizer,
-            model_state_dict=state_dict["model"],
-            optim_state_dict=state_dict["optim"]
-        )
-        self.load_metadata(state_dict["metadata"])
-    
-    def metadata(self):
-        return {"epoch": self.epoch, "step": self.step}
-    
-    def load_metadata(self, metadata):
-        self.epoch = metadata["epoch"]
-        self.step = metadata["step"]
-
-class CustomWriter(FileSystemWriter):
-    def __init__(
-        self,
-        path: Union[str, os.PathLike],
-        single_file_per_rank: bool = True,
-        sync_files: bool = True,
-        thread_count: int = 1,
-        per_thread_copy_ahead: int = 10_000_000,
-        cache_staged_state_dict: bool = False,
-        overwrite: bool = True,
-    ) -> None:
-        super().__init__(
-            path=path,
-            single_file_per_rank=single_file_per_rank,
-            sync_files=sync_files,
-            thread_count=thread_count,
-            per_thread_copy_ahead=per_thread_copy_ahead,
-            cache_staged_state_dict=cache_staged_state_dict,
-            overwrite=overwrite,
-        )
-        self.cache_staged_state_dict = cache_staged_state_dict
-
-    def stage(self, state_dict):
-        if not self.cache_staged_state_dict:
-            return _offload_state_dict_to_cpu(state_dict, type_check=self.type_check)
-
-        self.old_state_dict_cache = self.state_dict_cache
-        self.state_dict_cache = _offload_state_dict_to_cpu(state_dict)
-        self.old_state_dict_cache = None
-
-        return self.state_dict_cache
-
 class Trainer:
 
-    def __init__(self, global_rank: int, trainer_config: TrainerConfig, model, optimizer, train_dataset, test_dataset=None, profiler=None):
+    def __init__(
+        self,
+        world_size: int,
+        global_rank: int,
+        trainer_config: TrainerConfig,
+        model: torch.nn.Module,
+        optimizer,
+        train_dataset,
+        test_dataset=None,
+        profiler=None,
+    ):
         self.config = trainer_config
         # set torchrun variables
         self.global_rank = global_rank
         self.local_rank = self.global_rank % 8
+        self.world_size = world_size
         # data stuff
         self.train_dataset = train_dataset
         self.train_loader = self._prepare_dataloader(train_dataset)
         self.test_loader = self._prepare_dataloader(test_dataset) if test_dataset else None
         self.model = model
-        if torch.cuda.is_available():
-            self.model = self.model.to(self.local_rank)
         self.optimizer = optimizer        
         if self.config.use_amp:
             self.scaler = torch.cuda.amp.GradScaler()
-        # load snapshot if available. only necessary on the first node.
+
+        self.checkpoint_future = None
+        self.profiler = profiler
+
+    def _deferred_init(self):
+        if torch.cuda.is_available():
+            self.model = self.model.to(self.local_rank)
+        device_ids = [self.local_rank] if torch.cuda.is_available() else None
+        self.model = DDP(module=self.model, device_ids=device_ids)
         self.app_state = AppState(self.model, self.optimizer)
         self.writer = CustomWriter(path=CHECKPOINT_DIR, cache_staged_state_dict=True)
         self._load_checkpoint()
-        # initialize train states
-        # wrap with DDP. this step will synch model across all the processes.
-        device_ids = [self.local_rank] if torch.cuda.is_available() else None
-        self.model = DDP(module=self.model, device_ids=device_ids)
-        self.checkpoint_future = None
-        self.profiler = profiler
-        
+
     def _prepare_dataloader(self, dataset: Dataset):
         return DataLoader(
             dataset,
@@ -153,7 +81,7 @@ class Trainer:
             shuffle=False,
             num_workers=self.config.data_loader_workers,
             drop_last=True,
-            sampler=DistributedSampler(dataset)
+            sampler=DistributedSampler(dataset=dataset, num_replicas=self.world_size, rank=self.global_rank)
         )
 
     def _save_checkpoint(self, epoch: int, step: int):
@@ -240,6 +168,7 @@ class Trainer:
                     self._save_checkpoint(epoch, step)
 
     def train(self):
+        self._deferred_init()
         for epoch in range(int(self.app_state.epoch), self.config.max_epochs):
             self.app_state.epoch = epoch
             self._run_epoch(epoch, self.train_loader, train=True)

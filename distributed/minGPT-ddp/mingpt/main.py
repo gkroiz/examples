@@ -35,15 +35,12 @@ def get_train_objs(gpt_cfg: GPTConfig, opt_cfg: OptimizerConfig, data_cfg: DataC
 def start_processes(
     host_rank: int,
     world_size: int,
-    gpt_cfg: GPTConfig,
-    opt_cfg: OptimizerConfig,
-    data_cfg: DataConfig,
-    trainer_cfg: TrainerConfig,
+    cfg: DictConfig,
 ):
     processes = []
     for local_rank in range(8):
         global_rank = host_rank * 8 + local_rank
-        p = mp.Process(target=train_process, args=(global_rank, world_size, gpt_cfg, opt_cfg, data_cfg, trainer_cfg))
+        p = mp.Process(target=train_process, args=(global_rank, world_size, cfg))
         p.start()
         processes.append(p)
     return processes
@@ -51,12 +48,14 @@ def start_processes(
 def train_process(
     global_rank: int,
     world_size: int,
-    gpt_cfg: GPTConfig,
-    opt_cfg: OptimizerConfig,
-    data_cfg: DataConfig,
-    trainer_cfg: TrainerConfig,
+    cfg: DictConfig,
 ):
     ddp_setup(global_rank, world_size)
+
+    gpt_cfg = GPTConfig(**cfg['gpt_config'])
+    opt_cfg = OptimizerConfig(**cfg['optimizer_config'])
+    data_cfg = DataConfig(**cfg['data_config'])
+    trainer_cfg = TrainerConfig(**cfg['trainer_config'])
 
     if trainer_cfg.profile and global_rank == 0:
         profiler = torch.profiler.profile(
@@ -77,7 +76,7 @@ def train_process(
     else:
         profiler = None
     model, optimizer, train_data, test_data = get_train_objs(gpt_cfg, opt_cfg, data_cfg)
-    trainer = Trainer(global_rank, trainer_cfg, model, optimizer, train_data, test_data, profiler)
+    trainer = Trainer(world_size, global_rank, trainer_cfg, model, optimizer, train_data, test_data, profiler)
     trainer.train()
 
     if global_rank == 0:
@@ -87,11 +86,6 @@ def train_process(
 
 @hydra.main(version_base=None, config_path=".", config_name="gpt2_train_cfg")
 def main(cfg: DictConfig):
-
-    gpt_cfg = GPTConfig(**cfg['gpt_config'])
-    opt_cfg = OptimizerConfig(**cfg['optimizer_config'])
-    data_cfg = DataConfig(**cfg['data_config'])
-    trainer_cfg = TrainerConfig(**cfg['trainer_config'])
 
     world_size = int(os.environ["WORLD_SIZE"])
     host_rank = int(os.environ["HOST_RANK"])
@@ -108,10 +102,7 @@ def main(cfg: DictConfig):
     processes = start_processes(
         host_rank=host_rank,
         world_size=world_size,
-        gpt_cfg=gpt_cfg,
-        opt_cfg=opt_cfg,
-        data_cfg=data_cfg,
-        trainer_cfg=trainer_cfg,
+        cfg=cfg,
     )
 
 if __name__ == "__main__":
