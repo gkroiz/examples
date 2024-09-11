@@ -25,23 +25,18 @@ class AppState(Stateful):
 
     def state_dict(self):
         # this line automatically manages FSDP FQN's, as well as sets the default state dict type to FSDP.SHARDED_STATE_DICT
-        model_state_dict, optimizer_state_dict = get_state_dict(self.model, self.optimizer)
         return {
-            "model": model_state_dict,
-            "optim": optimizer_state_dict,
+            "model": self.model.state_dict(),
+            "optim": self.optimizer.state_dict(),
             "metadata": self.metadata()
         }
 
     def load_state_dict(self, state_dict):
         # sets our state dicts on the model and optimizer, now that we've loaded
-        set_state_dict(
-            self.model,
-            self.optimizer,
-            model_state_dict=state_dict["model"],
-            optim_state_dict=state_dict["optim"]
-        )
+        self.model.load_state_dict(state_dict["model"])
+        self.optimizer.load_state_dict(state_dict["optim"])
         self.load_metadata(state_dict["metadata"])
-    
+
     def metadata(self):
         return {"epoch": self.epoch, "step": self.step}
     

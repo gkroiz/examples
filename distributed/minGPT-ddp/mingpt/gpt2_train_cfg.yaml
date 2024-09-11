@@ -12,10 +12,13 @@ trainer_config:
   batch_size: 216
   data_loader_workers: 4
   grad_norm_clip: 1.0
-  use_amp: True
+  use_amp: True # Only works with ddp
   profile: True
   ckpt_method: 'redis' # 'redis', 'torch', or None
   debug: False
+  training_strategy: 'ddp' # 'ddp', 'fsdp', or 'hsdp' are supported
+  num_data_replicas: null # None or an integer. Only set to use HSDP
+  data_replica_size: null # None or an integer. Only set to use HSDP
 optimizer_config:
   weight_decay: 0.1
   learning_rate: 0.0003

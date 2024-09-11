@@ -16,8 +16,8 @@ import gc
 
 import torch
 from torch.utils.data import Dataset, DataLoader
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 import torch.distributed.checkpoint as dcp
 from torch.profiler import profile, record_function
@@ -38,6 +38,9 @@ class TrainerConfig:
     profile: bool = None
     ckpt_method: bool = None
     debug: bool = None
+    training_strategy: str = None
+    num_data_replicas: int = None
+    data_replica_size: int = None
 
 class Trainer:
 
@@ -94,8 +97,19 @@ class Trainer:
 
         if torch.cuda.is_available():
             self.model = self.model.to(self.local_rank)
-        device_ids = [self.local_rank] if torch.cuda.is_available() else None
-        self.model = DDP(module=self.model, device_ids=device_ids)
+        if self.config.training_strategy == "ddp":
+            device_ids = [self.local_rank] if torch.cuda.is_available() else None
+            self.model = DDP(module=self.model, device_ids=device_ids)
+        elif self.config.training_strategy == "fsdp":
+            self.model = FSDP(self.model)
+        elif self.config.training_strategy == "hsdp":
+            from torch.distributed.device_mesh import init_device_mesh
+            assert self.config.num_data_replicas is not None, "num_model_replicas must be set for HSDP"
+            assert self.config.data_replica_size is not None, "num_data_replicas must be set for HSDP"
+            device_mesh = init_device_mesh(self.config.num_data_replicas, self.config.data_replica_size)
+            self.model = FSDP(self.model, device_mesh=device_mesh)
+        else:
+            raise ValueError("Invalid training strategy")
         self.writer = CustomWriter(path=CHECKPOINT_DIR, cache_staged_state_dict=True)
         self._load_checkpoint()
 
