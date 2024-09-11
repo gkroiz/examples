@@ -133,7 +133,9 @@ class Trainer:
         if self.global_rank == 0:
             curr_time = datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S')
             print(f"Starting async checkpoint at {curr_time}")
-        if self.config.ckpt_method == "torch":
+        if self.config.ckpt_method is None:
+            return
+        elif self.config.ckpt_method == "torch":
             self.checkpoint_future = dcp.async_save(
                 state_dict={"app": self.app_state},
                 checkpoint_id=f"{CHECKPOINT_DIR}ckpt_epoch{epoch}_step{step}",
@@ -172,7 +174,10 @@ class Trainer:
 
     def _load_checkpoint(self):
         # Find all files matching the pattern
-        if self.config.ckpt_method == "torch":
+        if self.config.ckpt_method is None:
+            print("Checkpointing is disabled. Training model from scratch")
+            return
+        elif self.config.ckpt_method == "torch":
             checkpoint_files = glob.glob(f"{CHECKPOINT_DIR}ckpt_epoch*_step*")
             checkpoint_files = [file for file in checkpoint_files if os.path.exists(os.path.join(file, ".metadata"))]
 
