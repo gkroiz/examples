@@ -9,6 +9,7 @@ from trainer import Trainer, TrainerConfig
 from char_dataset import CharDataset, DataConfig
 from omegaconf import DictConfig
 import hydra
+import redis
 
 import torch.multiprocessing as mp
 from torch.profiler import profile, schedule, tensorboard_trace_handler
@@ -36,11 +37,12 @@ def start_processes(
     host_rank: int,
     world_size: int,
     cfg: DictConfig,
+    redis_client: redis.Redis,
 ):
     processes = []
     for local_rank in range(8):
         global_rank = host_rank * 8 + local_rank
-        p = mp.Process(target=train_process, args=(global_rank, world_size, cfg))
+        p = mp.Process(target=train_process, args=(global_rank, world_size, cfg, redis_client))
         p.start()
         processes.append(p)
     return processes
@@ -49,6 +51,7 @@ def train_process(
     global_rank: int,
     world_size: int,
     cfg: DictConfig,
+    redis_client: redis.Redis,
 ):
     ddp_setup(global_rank, world_size)
 
@@ -76,7 +79,7 @@ def train_process(
     else:
         profiler = None
     model, optimizer, train_data, test_data = get_train_objs(gpt_cfg, opt_cfg, data_cfg)
-    trainer = Trainer(world_size, global_rank, trainer_cfg, model, optimizer, train_data, test_data, profiler)
+    trainer = Trainer(world_size, global_rank, trainer_cfg, train_data, test_data, model, optimizer, profiler, redis_client)
     trainer.train()
 
     if global_rank == 0:
@@ -99,10 +102,13 @@ def main(cfg: DictConfig):
         sock.close()
         os.environ["MASTER_PORT"] = str(port)
 
+    redis_client = redis.Redis(host="localhost", port=6379, db=0)
+
     processes = start_processes(
         host_rank=host_rank,
         world_size=world_size,
         cfg=cfg,
+        redis_client=redis_client,
     )
 
 if __name__ == "__main__":

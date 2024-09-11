@@ -6,7 +6,6 @@ from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed._state_dict_utils import (
     _offload_state_dict_to_cpu,
-    _create_cpu_state_dict,
 )
 
 class AppState(Stateful):
@@ -81,3 +80,6 @@ class CustomWriter(FileSystemWriter):
         self.old_state_dict_cache = None
 
         return self.state_dict_cache
+
+def offload_state_dict_to_cpu(state_dict):
+    return _offload_state_dict_to_cpu(state_dict)
