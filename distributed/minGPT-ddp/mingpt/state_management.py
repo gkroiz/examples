@@ -1,12 +1,11 @@
-
 import os
 from typing import Union
 from torch.distributed.checkpoint.filesystem import FileSystemWriter
 from torch.distributed.checkpoint.stateful import Stateful
-from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed._state_dict_utils import (
     _offload_state_dict_to_cpu,
 )
+
 
 class AppState(Stateful):
     """This is a useful wrapper for checkpointing the Application State. Since this object is compliant
@@ -28,7 +27,7 @@ class AppState(Stateful):
         return {
             "model": self.model.state_dict(),
             "optim": self.optimizer.state_dict(),
-            "metadata": self.metadata()
+            "metadata": self.metadata(),
         }
 
     def load_state_dict(self, state_dict):
@@ -39,10 +38,11 @@ class AppState(Stateful):
 
     def metadata(self):
         return {"epoch": self.epoch, "step": self.step}
-    
+
     def load_metadata(self, metadata):
         self.epoch = metadata["epoch"]
         self.step = metadata["step"]
+
 
 class CustomWriter(FileSystemWriter):
     def __init__(
@@ -75,6 +75,7 @@ class CustomWriter(FileSystemWriter):
         self.old_state_dict_cache = None
 
         return self.state_dict_cache
+
 
 def offload_state_dict_to_cpu(state_dict):
     return _offload_state_dict_to_cpu(state_dict)

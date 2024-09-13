@@ -1,6 +1,5 @@
 import os
 import socket
-from datetime import datetime
 import torch
 from torch.utils.data import random_split
 from torch.distributed import init_process_group, destroy_process_group
@@ -12,7 +11,6 @@ import hydra
 import redis
 
 import torch.multiprocessing as mp
-from torch.profiler import profile, schedule, tensorboard_trace_handler
 
 
 def ddp_setup(global_rank: int, world_size: int):
@@ -20,6 +18,7 @@ def ddp_setup(global_rank: int, world_size: int):
     init_process_group(backend=backend, rank=global_rank, world_size=world_size)
     if torch.cuda.is_available():
         torch.cuda.set_device(global_rank % 8)
+
 
 def get_train_objs(gpt_cfg: GPTConfig, opt_cfg: OptimizerConfig, data_cfg: DataConfig):
     dataset = CharDataset(data_cfg)
@@ -30,8 +29,9 @@ def get_train_objs(gpt_cfg: GPTConfig, opt_cfg: OptimizerConfig, data_cfg: DataC
     gpt_cfg.block_size = dataset.block_size
     model = GPT(gpt_cfg)
     optimizer = create_optimizer(model, opt_cfg)
-    
+
     return model, optimizer, train_set, test_set
+
 
 def start_processes(
     host_rank: int,
@@ -42,10 +42,13 @@ def start_processes(
     processes = []
     for local_rank in range(8):
         global_rank = host_rank * 8 + local_rank
-        p = mp.Process(target=train_process, args=(global_rank, world_size, cfg, redis_client))
+        p = mp.Process(
+            target=train_process, args=(global_rank, world_size, cfg, redis_client)
+        )
         p.start()
         processes.append(p)
     return processes
+
 
 def train_process(
     global_rank: int,
@@ -55,10 +58,10 @@ def train_process(
 ):
     ddp_setup(global_rank, world_size)
 
-    gpt_cfg = GPTConfig(**cfg['gpt_config'])
-    opt_cfg = OptimizerConfig(**cfg['optimizer_config'])
-    data_cfg = DataConfig(**cfg['data_config'])
-    trainer_cfg = TrainerConfig(**cfg['trainer_config'])
+    gpt_cfg = GPTConfig(**cfg["gpt_config"])
+    opt_cfg = OptimizerConfig(**cfg["optimizer_config"])
+    data_cfg = DataConfig(**cfg["data_config"])
+    trainer_cfg = TrainerConfig(**cfg["trainer_config"])
 
     if trainer_cfg.profile and global_rank == 0:
         profiler = torch.profiler.profile(
@@ -67,9 +70,12 @@ def train_process(
                 torch.profiler.ProfilerActivity.CUDA,
             ],
             schedule=torch.profiler.schedule(
-                wait=1, warmup=1, active=5, repeat=3  # Customize profiling timing
+                wait=1,
+                warmup=1,
+                active=5,
+                repeat=3,  # Customize profiling timing
             ),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler('./logs/minGPT'),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler("./logs/minGPT"),
             record_shapes=True,
             profile_memory=True,
             with_flops=True,
@@ -79,7 +85,17 @@ def train_process(
     else:
         profiler = None
     model, optimizer, train_data, test_data = get_train_objs(gpt_cfg, opt_cfg, data_cfg)
-    trainer = Trainer(world_size, global_rank, trainer_cfg, train_data, test_data, model, optimizer, profiler, redis_client)
+    trainer = Trainer(
+        world_size,
+        global_rank,
+        trainer_cfg,
+        train_data,
+        test_data,
+        model,
+        optimizer,
+        profiler,
+        redis_client,
+    )
     trainer.train()
 
     if global_rank == 0:
@@ -87,12 +103,12 @@ def train_process(
 
     destroy_process_group()
 
+
 @hydra.main(version_base=None, config_path=".", config_name="gpt2_train_cfg")
 def main(cfg: DictConfig):
-
     world_size = int(os.environ["WORLD_SIZE"])
     host_rank = int(os.environ["HOST_RANK"])
-    
+
     if os.environ.get("MASTER_ADDR") is None:
         os.environ["MASTER_ADDR"] = "localhost"
     if os.environ.get("MASTER_PORT") is None:
@@ -104,12 +120,13 @@ def main(cfg: DictConfig):
 
     redis_client = redis.Redis(host="localhost", port=6379, db=0)
 
-    processes = start_processes(
+    _ = start_processes(
         host_rank=host_rank,
         world_size=world_size,
         cfg=cfg,
         redis_client=redis_client,
     )
+
 
 if __name__ == "__main__":
     main()
