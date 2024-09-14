@@ -72,6 +72,8 @@ class Trainer:
         self.app_state = AppState(
             model, optimizer, world_size=world_size, batch_size=self.config.batch_size
         )
+        self.epoch = 0
+        self.step = 0
 
     @property
     def model(self):
@@ -120,6 +122,9 @@ class Trainer:
             raise ValueError("Invalid training strategy")
         self.writer = CustomWriter(path=CHECKPOINT_DIR, cache_staged_state_dict=True)
         self._load_checkpoint()
+        # Update epoch and step counts
+        self.epoch = self.app_state.epoch
+        self.step = self.app_state.step
         # Create the dataloaders. This requires information stored in checkpoint metadata
         self.train_loader = self._prepare_dataloader(
             self.train_dataset,
@@ -177,6 +182,9 @@ class Trainer:
         return True
 
     def _save_checkpoint(self, epoch: int, step: int):
+        # Update app_state with the current epoch and step
+        self.app_state.epoch = epoch
+        self.app_state.step = step
         if self.global_rank == 0:
             curr_time = datetime.fromtimestamp(time.time()).strftime(
                 "%Y-%m-%d %H:%M:%S"
@@ -301,7 +309,7 @@ class Trainer:
     def _run_epoch(self, epoch: int, dataloader: DataLoader, train: bool = True):
         dataloader.sampler.set_epoch(epoch)
         start = time.time()
-        step = self.app_state.step if train else 0
+        step = self.step if train else 0
         for source, targets in dataloader:
             if self.config.debug and self.global_rank == 0:
                 print(
@@ -324,19 +332,21 @@ class Trainer:
                     )
                 start = time.time()
 
-            step += 1
             # Only when training
             if train:
                 if self.checkpoint_future is None or self.checkpoint_future.result():
                     self._save_checkpoint(epoch, step)
 
-                # Update step counter
-                self.app_state.step = step
+                # Update trainer step counter
+                self.step += 1
+
+            # Update local step counter
+            step += 1
 
     def train(self, model=None, optimizer=None):
         self._deferred_init(model, optimizer)
-        for epoch in range(int(self.app_state.epoch), self.config.max_epochs):
-            self.app_state.epoch = epoch
+        for epoch in range(int(self.epoch), self.config.max_epochs):
+            self.epoch = epoch
             self._run_epoch(epoch, self.train_loader, train=True)
             # eval run
             if self.test_loader:
