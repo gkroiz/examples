@@ -18,16 +18,25 @@ class AppState(Stateful):
     """
 
     def __init__(
-        self, model, optimizer=None, epoch=0, step=0, world_size=None, batch_size=None
+        self,
+        model,
+        optimizer=None,
+        epoch=0,
+        step=0,
+        world_size=None,
+        micro_batch_size=None,
+        global_batch_size=None,
     ):
         self.model = model
         self.optimizer = optimizer
         self.epoch = epoch
         self.step = step
         self.world_size = world_size
-        self.batch_size = batch_size
+        self.micro_batch_size = micro_batch_size
+        self.global_batch_size = global_batch_size
         self.prev_world_size = None
-        self.prev_batch_size = None
+        self.prev_micro_batch_size = None
+        self.prev_global_batch_size = None
 
     def state_dict(self):
         # this line automatically manages FSDP FQN's, as well as sets the default state dict type to FSDP.SHARDED_STATE_DICT
@@ -48,14 +57,16 @@ class AppState(Stateful):
             "epoch": self.epoch,
             "step": self.step,
             "world_size": self.world_size,
-            "batch_size": self.batch_size,
+            "micro_batch_size": self.micro_batch_size,
+            "global_batch_size": self.global_batch_size,
         }
 
     def load_metadata(self, metadata):
         self.epoch = metadata["epoch"]
         self.step = metadata["step"]
         self.prev_world_size = metadata["world_size"]
-        self.prev_batch_size = metadata["batch_size"]
+        self.prev_micro_batch_size = metadata["micro_batch_size"]
+        self.prev_global_batch_size = metadata["global_batch_size"]
 
 
 class CustomWriter(FileSystemWriter):

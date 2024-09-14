@@ -16,7 +16,7 @@ class AdaptrDistributedSampler(DistributedSampler):
         seed: int = 0,
         drop_last: bool = False,
         start_step: int = 0,
-        prev_batch_size: int = -1,
+        prev_global_batch_size: int = -1,
     ) -> None:
         """DistributedSampler that can resume sampling from a previous state.
         Additional args:
@@ -24,7 +24,7 @@ class AdaptrDistributedSampler(DistributedSampler):
 
         super().__init__(dataset, num_replicas, rank, shuffle, seed, drop_last)
         self.prev_num_replicas = prev_num_replicas
-        self.prev_batch_size = prev_batch_size
+        self.prev_global_batch_size = prev_global_batch_size
         self.start_step = start_step
 
     def __iter__(self):
@@ -60,7 +60,7 @@ class AdaptrDistributedSampler(DistributedSampler):
             for replica in range(self.prev_num_replicas):
                 replica_indices = indices[replica : self.total_size : self.num_replicas]
                 used_indices.extend(
-                    replica_indices[: self.start_step * self.prev_batch_size]
+                    replica_indices[: self.start_step * self.prev_global_batch_size]
                 )
 
             # Remove used indices. Due to drop_last, only remove the first occurence of used_index in indices.

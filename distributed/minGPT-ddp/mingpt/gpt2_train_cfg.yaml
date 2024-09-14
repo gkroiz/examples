@@ -9,7 +9,8 @@ gpt_config:
   n_embd: 512
 trainer_config:
   max_epochs: 1
-  batch_size: 216
+  micro_batch_size: 72
+  global_batch_size: 216
   data_loader_workers: 4
   grad_norm_clip: 1.0
   use_amp: True # Only works with ddp

@@ -8,6 +8,7 @@ from typing import Optional
 import os
 import glob
 import time
+from contextlib import nullcontext
 from datetime import datetime
 import pickle
 import psutil
@@ -28,7 +29,8 @@ CHECKPOINT_DIR = "checkpoint/"
 @dataclass
 class TrainerConfig:
     max_epochs: int = None
-    batch_size: int = None
+    micro_batch_size: int = None
+    global_batch_size: int = None
     data_loader_workers: int = None
     grad_norm_clip: float = None
     snapshot_path: Optional[str] = None
@@ -70,10 +72,18 @@ class Trainer:
         self.profiler = profiler
         self.redis_client = redis_client
         self.app_state = AppState(
-            model, optimizer, world_size=world_size, batch_size=self.config.batch_size
+            model=model,
+            optimizer=optimizer,
+            world_size=world_size,
+            micro_batch_size=self.config.micro_batch_size,
+            global_batch_size=self.config.global_batch_size,
         )
         self.epoch = 0
         self.step = 0
+        self.gradient_accumulation_steps = (
+            self.config.global_batch_size // self.config.micro_batch_size
+        )
+        assert self.gradient_accumulation_steps > 0
 
     @property
     def model(self):
@@ -130,7 +140,7 @@ class Trainer:
             self.train_dataset,
             self.app_state.step,
             self.app_state.prev_world_size,
-            self.app_state.prev_batch_size,
+            self.app_state.prev_global_batch_size,
         )
         self.test_loader = (
             self._prepare_dataloader(self.test_dataset, 0)
@@ -142,11 +152,15 @@ class Trainer:
             print(f"Deferred init took {time.time() - start:.2f}s")
 
     def _prepare_dataloader(
-        self, dataset: Dataset, start_step=0, prev_world_size=None, prev_batch_size=None
+        self,
+        dataset: Dataset,
+        start_step=0,
+        prev_world_size=None,
+        prev_global_batch_size=None,
     ):
         return DataLoader(
             dataset,
-            batch_size=self.config.batch_size,
+            batch_size=self.config.micro_batch_size,
             pin_memory=True,
             shuffle=False,
             num_workers=self.config.data_loader_workers,
@@ -158,7 +172,7 @@ class Trainer:
                 rank=self.global_rank,
                 drop_last=False,
                 start_step=start_step,
-                prev_batch_size=prev_batch_size,
+                prev_global_batch_size=prev_global_batch_size,
             ),
         )
 
@@ -275,15 +289,20 @@ class Trainer:
         else:
             raise ValueError("Invalid checkpoint method")
 
-    def _run_batch(self, source, targets, train: bool = True) -> float:
+    def _run_batch(
+        self, source, targets, is_accumulating: bool, train: bool = True
+    ) -> float:
+        #
         with torch.set_grad_enabled(train), torch.amp.autocast(
             device_type="cuda", dtype=torch.float16, enabled=(self.config.use_amp)
         ):
-            with record_function("FWD"):
-                _, loss = self.model(source, targets)
+            # According to https://huggingface.co/docs/accelerate/en/concept_guides/gradient_synchronization,
+            # Forward step with FSDP and gradient accumulation should have no_sync() context manager
+            with self.model.no_sync() if self.config.training_strategy == "fsdp" else nullcontext():
+                with record_function("FWD"):
+                    _, loss = self.model(source, targets)
 
         if train:
-            self.optimizer.zero_grad(set_to_none=True)
             if self.config.use_amp:
                 with record_function("BWD"):
                     self.scaler.scale(loss).backward()
@@ -294,15 +313,25 @@ class Trainer:
                 with record_function("OPT"):
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
+                self.optimizer.zero_grad(set_to_none=True)
+
             else:
-                with record_function("BWD"):
-                    loss.backward()
-                with record_function("CLIP"):
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.config.grad_norm_clip
-                    )
-                with record_function("OPT"):
-                    self.optimizer.step()
+                # Divide loss by number of gradient accumulation steps
+                loss = loss / self.gradient_accumulation_steps
+
+                # Backward pass
+                with self.model.no_sync() if self.config.training_strategy == "fsdp" else nullcontext():
+                    with record_function("BWD"):
+                        loss.backward()
+
+                if not is_accumulating:
+                    with record_function("CLIP"):
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), self.config.grad_norm_clip
+                        )
+                    with record_function("OPT"):
+                        self.optimizer.step()
+                    self.optimizer.zero_grad(set_to_none=True)
 
         return loss.item()
 
@@ -310,38 +339,52 @@ class Trainer:
         dataloader.sampler.set_epoch(epoch)
         start = time.time()
         step = self.step if train else 0
-        for source, targets in dataloader:
+        step_loss = 0
+        # Iterate through each batch in the dataloader
+        for dataloader_iter, (source, targets) in enumerate(dataloader):
+            # Boolean determining whether all gradients have accumulated for this step
+            is_accumulating = (
+                dataloader_iter + 1
+            ) % self.gradient_accumulation_steps != 0
+
             if self.config.debug and self.global_rank == 0:
                 print(
-                    f"Epoch {epoch} | Step {step} CPU RAM Used (GB): {psutil.virtual_memory()[3]/1000000000}"
+                    f"Epoch {epoch} | Step {step} | Iter {dataloader_iter} CPU RAM Used (GB): {psutil.virtual_memory()[3]/1000000000}"
                 )
 
             step_type = "Train" if train else "Eval"
             if torch.cuda.is_available():
                 source = source.to(self.local_rank)
                 targets = targets.to(self.local_rank)
-            batch_loss = self._run_batch(source, targets, train)
+            batch_loss = self._run_batch(source, targets, is_accumulating, train)
+            step_loss += batch_loss
 
             if self.profiler:
                 self.profiler.step()
 
-            if step % 10 == 0:
+            if step % 10 == 0 and not is_accumulating:
                 if self.global_rank == 0:
                     print(
-                        f"[GPU{self.global_rank}] Epoch {epoch} | Step {step} | {step_type} Loss {batch_loss:.5f} | Average Step Time {(time.time() - start)/100:.2f}s"
+                        f"[GPU{self.global_rank}] Epoch {epoch} | Step {step} | {step_type} Loss {step_loss:.5f} | Average Step Time {(time.time() - start)/100:.2f}s"
                     )
                 start = time.time()
 
-            # Only when training
-            if train:
-                if self.checkpoint_future is None or self.checkpoint_future.result():
-                    self._save_checkpoint(epoch, step)
+            # Check if you can checkpoint, increment step counters, and reset step_loss
+            if not is_accumulating:
+                # Only checkpoint when training
+                if train:
+                    if (
+                        self.checkpoint_future is None
+                        or self.checkpoint_future.result()
+                    ):
+                        self._save_checkpoint(epoch, step)
 
-                # Update trainer step counter
-                self.step += 1
+                    # Update trainer step counter
+                    self.step += 1
 
-            # Update local step counter
-            step += 1
+                # Update local step counter
+                step += 1
+                step_loss = 0
 
     def train(self, model=None, optimizer=None):
         self._deferred_init(model, optimizer)
