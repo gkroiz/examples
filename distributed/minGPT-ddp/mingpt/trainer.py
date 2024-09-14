@@ -14,7 +14,7 @@ import psutil
 
 import torch
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.data.distributed import DistributedSampler
+from sampler import AdaptrDistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 import torch.distributed.checkpoint as dcp
@@ -62,17 +62,16 @@ class Trainer:
         self.world_size = world_size
         # data stuff
         self.train_dataset = train_dataset
-        self.train_loader = self._prepare_dataloader(train_dataset)
-        self.test_loader = (
-            self._prepare_dataloader(test_dataset) if test_dataset else None
-        )
+        self.test_dataset = test_dataset
         if self.config.use_amp:
             self.scaler = torch.cuda.amp.GradScaler()
 
         self.checkpoint_future = None
         self.profiler = profiler
         self.redis_client = redis_client
-        self.app_state = AppState(model, optimizer)
+        self.app_state = AppState(
+            model, optimizer, world_size=world_size, batch_size=self.config.batch_size
+        )
 
     @property
     def model(self):
@@ -91,6 +90,7 @@ class Trainer:
         self.app_state.optimizer = optimizer
 
     def _deferred_init(self, model=None, optimizer=None):
+        start = time.time()
         if self.model is None:
             self.model = model
         if self.optimizer is None:
@@ -120,17 +120,40 @@ class Trainer:
             raise ValueError("Invalid training strategy")
         self.writer = CustomWriter(path=CHECKPOINT_DIR, cache_staged_state_dict=True)
         self._load_checkpoint()
+        # Create the dataloaders. This requires information stored in checkpoint metadata
+        self.train_loader = self._prepare_dataloader(
+            self.train_dataset,
+            self.app_state.step,
+            self.app_state.prev_world_size,
+            self.app_state.prev_batch_size,
+        )
+        self.test_loader = (
+            self._prepare_dataloader(self.test_dataset, 0)
+            if self.test_dataset
+            else None
+        )
+        # Once dataloaders are created, we can update app_state to reflect
+        if self.global_rank == 0:
+            print(f"Deferred init took {time.time() - start:.2f}s")
 
-    def _prepare_dataloader(self, dataset: Dataset):
+    def _prepare_dataloader(
+        self, dataset: Dataset, start_step=0, prev_world_size=None, prev_batch_size=None
+    ):
         return DataLoader(
             dataset,
             batch_size=self.config.batch_size,
             pin_memory=True,
             shuffle=False,
             num_workers=self.config.data_loader_workers,
-            drop_last=True,
-            sampler=DistributedSampler(
-                dataset=dataset, num_replicas=self.world_size, rank=self.global_rank
+            drop_last=False,
+            sampler=AdaptrDistributedSampler(
+                dataset=dataset,
+                num_replicas=self.world_size,
+                prev_num_replicas=prev_world_size,
+                rank=self.global_rank,
+                drop_last=False,
+                start_step=start_step,
+                prev_batch_size=prev_batch_size,
             ),
         )
 
@@ -278,14 +301,12 @@ class Trainer:
     def _run_epoch(self, epoch: int, dataloader: DataLoader, train: bool = True):
         dataloader.sampler.set_epoch(epoch)
         start = time.time()
-        for step, (source, targets) in enumerate(dataloader):
-            if step < self.app_state.step:
-                continue
+        step = self.app_state.step if train else 0
+        for source, targets in dataloader:
             if self.config.debug and self.global_rank == 0:
                 print(
                     f"Epoch {epoch} | Step {step} CPU RAM Used (GB): {psutil.virtual_memory()[3]/1000000000}"
                 )
-            self.app_state.step = step
 
             step_type = "Train" if train else "Eval"
             if torch.cuda.is_available():
@@ -303,12 +324,14 @@ class Trainer:
                     )
                 start = time.time()
 
-            if self.checkpoint_future is None or self.checkpoint_future.result():
-                self._save_checkpoint(epoch, step)
-            else:
-                print(
-                    "self.checkpoint_future.result(): ", self.checkpoint_future.result()
-                )
+            step += 1
+            # Only when training
+            if train:
+                if self.checkpoint_future is None or self.checkpoint_future.result():
+                    self._save_checkpoint(epoch, step)
+
+                # Update step counter
+                self.app_state.step = step
 
     def train(self, model=None, optimizer=None):
         self._deferred_init(model, optimizer)

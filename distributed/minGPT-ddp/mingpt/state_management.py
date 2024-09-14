@@ -1,5 +1,6 @@
 import os
 from typing import Union
+
 from torch.distributed.checkpoint.filesystem import FileSystemWriter
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed._state_dict_utils import (
@@ -16,18 +17,24 @@ class AppState(Stateful):
     and optimizer.
     """
 
-    def __init__(self, model, optimizer=None, epoch=0, step=0):
+    def __init__(
+        self, model, optimizer=None, epoch=0, step=0, world_size=None, batch_size=None
+    ):
         self.model = model
         self.optimizer = optimizer
         self.epoch = epoch
         self.step = step
+        self.world_size = world_size
+        self.batch_size = batch_size
+        self.prev_world_size = None
+        self.prev_batch_size = None
 
     def state_dict(self):
         # this line automatically manages FSDP FQN's, as well as sets the default state dict type to FSDP.SHARDED_STATE_DICT
         return {
             "model": self.model.state_dict(),
             "optim": self.optimizer.state_dict(),
-            "metadata": self.metadata(),
+            "metadata": self.get_metadata(),
         }
 
     def load_state_dict(self, state_dict):
@@ -36,12 +43,19 @@ class AppState(Stateful):
         self.optimizer.load_state_dict(state_dict["optim"])
         self.load_metadata(state_dict["metadata"])
 
-    def metadata(self):
-        return {"epoch": self.epoch, "step": self.step}
+    def get_metadata(self):
+        return {
+            "epoch": self.epoch,
+            "step": self.step,
+            "world_size": self.world_size,
+            "batch_size": self.batch_size,
+        }
 
     def load_metadata(self, metadata):
         self.epoch = metadata["epoch"]
         self.step = metadata["step"]
+        self.prev_world_size = metadata["world_size"]
+        self.prev_batch_size = metadata["batch_size"]
 
 
 class CustomWriter(FileSystemWriter):
