@@ -187,6 +187,10 @@ class Trainer:
 
         if not response:
             raise Exception("Failed to set checkpoint in Redis.")
+
+        # Wait for all ranks to finish saving the checkpoint before proceeding
+        torch.distributed.barrier()
+
         if self.redis_client.exists(checkpoint_key + "_backup"):
             self.redis_client.delete(checkpoint_key + "_backup")
 
@@ -231,19 +235,35 @@ class Trainer:
 
     def _redis_load(self):
         checkpoint_key = f"ckpt_rank_{self.global_rank}"
-        if self.redis_client.exists(checkpoint_key):
-            print(f"Loading checkpoint from redis {checkpoint_key}")
-        elif self.redis_client.exists(checkpoint_key + "_backup"):
-            print(f"Loading checkpoint from redis {checkpoint_key}_backup")
-            checkpoint_key += "_backup"
+        use_backup = torch.tensor(0)
+        if self.redis_client.exists(checkpoint_key + "_backup"):
+            print(f"Found checkpoint from redis {checkpoint_key}_backup")
+            use_backup += 1
+        elif self.redis_client.exists(checkpoint_key):
+            print(f"Found checkpoint from redis {checkpoint_key}")
         else:
             print("Checkpoint not found. Training model from scratch")
             return
+
+        # Check if any rank needs to use the backup
+        torch.distributed.all_reduce(use_backup, op=torch.distributed.ReduceOp.SUM)
+        if use_backup.item() > 0:
+            checkpoint_key += "_backup"
+
+            assert (
+                use_backup.item() == self.world_size
+            ), "Backup checkpoint exists on some ranks but not all"
+
+        print("Checkpointing key: ", checkpoint_key)
 
         # Load and unserialize the state_dict
         serialized_dict = self.redis_client.get(checkpoint_key)
         state_dict = pickle.loads(serialized_dict)
         self.app_state.load_state_dict(state_dict)
+
+        # Update model and optimizer with the loaded state_dict
+        self.model.load_state_dict(state_dict["model"])
+        self.optimizer.load_state_dict(state_dict["optim"])
         print(
             f"Resuming training from checkpoint at epoch {self.app_state.epoch} step {self.app_state.step}"
         )
