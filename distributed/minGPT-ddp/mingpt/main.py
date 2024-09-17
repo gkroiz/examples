@@ -6,8 +6,7 @@ from torch.distributed import init_process_group, destroy_process_group
 from model import GPT, GPTConfig, OptimizerConfig, create_optimizer
 from trainer import Trainer, TrainerConfig
 from char_dataset import CharDataset, DataConfig
-from omegaconf import DictConfig
-import hydra
+from omegaconf import DictConfig, OmegaConf
 import redis
 
 import torch.multiprocessing as mp
@@ -104,8 +103,10 @@ def train_process(
     destroy_process_group()
 
 
-@hydra.main(version_base=None, config_path=".", config_name="gpt2_train_cfg")
-def main(cfg: DictConfig):
+def main():
+    # Load config
+    cfg = OmegaConf.load("gpt2_train_cfg.yaml")
+
     world_size = int(os.environ["WORLD_SIZE"])
     host_rank = int(os.environ["HOST_RANK"])
 
