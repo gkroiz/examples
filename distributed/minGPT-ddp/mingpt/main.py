@@ -36,13 +36,13 @@ def start_processes(
     host_rank: int,
     world_size: int,
     cfg: DictConfig,
-    redis_client: redis.Redis,
+    redis_port: int,
 ):
     processes = []
     for local_rank in range(8):
         global_rank = host_rank * 8 + local_rank
         p = mp.Process(
-            target=train_process, args=(global_rank, world_size, cfg, redis_client)
+            target=train_process, args=(global_rank, world_size, cfg, redis_port)
         )
         p.start()
         processes.append(p)
@@ -53,8 +53,10 @@ def train_process(
     global_rank: int,
     world_size: int,
     cfg: DictConfig,
-    redis_client: redis.Redis,
+    redis_port: int,
+    host_name: str = None,
 ):
+    redis_client = redis.Redis(host="localhost", port=redis_port, db=0)
     ddp_setup(global_rank, world_size)
 
     gpt_cfg = GPTConfig(**cfg["gpt_config"])
@@ -94,10 +96,11 @@ def train_process(
         optimizer,
         profiler,
         redis_client,
+        host_name,
     )
     trainer.train()
 
-    if global_rank == 0:
+    if trainer_cfg.profile and global_rank == 0:
         profiler.stop()
 
     destroy_process_group()
@@ -119,13 +122,11 @@ def main():
         sock.close()
         os.environ["MASTER_PORT"] = str(port)
 
-    redis_client = redis.Redis(host="localhost", port=6379, db=0)
-
     _ = start_processes(
         host_rank=host_rank,
         world_size=world_size,
         cfg=cfg,
-        redis_client=redis_client,
+        redis_port=6379,
     )
 
 

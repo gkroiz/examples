@@ -4,22 +4,22 @@ data_config:
   train_split: 0.9
   truncate: 0.05
 gpt_config:
-  n_layer: 8
-  n_head: 8
+  n_layer: 16
+  n_head: 16
   n_embd: 512
 trainer_config:
-  max_epochs: 1
+  max_epochs: 10
   micro_batch_size: 72
   global_batch_size: 216
   data_loader_workers: 4
   grad_norm_clip: 1.0
-  use_amp: True # Only works with ddp
-  profile: True
+  use_amp: False # Only works with ddp
+  profile: False
   ckpt_method: 'redis' # 'redis', 'torch', or None
-  debug: False
-  training_strategy: 'ddp' # 'ddp', 'fsdp', or 'hsdp' are supported
-  num_data_replicas: null # None or an integer. Only set to use HSDP
-  data_replica_size: null # None or an integer. Only set to use HSDP
+  debug: True
+  training_strategy: 'hsdp' # 'ddp', 'fsdp', or 'hsdp' are supported
+  num_data_replicas: 4 # None or an integer. Only set to use HSDP
+  data_replica_size: 8 # None or an integer. Only set to use HSDP
 optimizer_config:
   weight_decay: 0.1
   learning_rate: 0.0003

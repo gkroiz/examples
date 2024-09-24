@@ -10,7 +10,6 @@ class AdaptrDistributedSampler(DistributedSampler):
         self,
         dataset: Dataset,
         num_replicas: Optional[int] = None,
-        prev_num_replicas: Optional[int] = None,
         rank: Optional[int] = None,
         shuffle: bool = True,
         seed: int = 0,
@@ -23,7 +22,6 @@ class AdaptrDistributedSampler(DistributedSampler):
         """
 
         super().__init__(dataset, num_replicas, rank, shuffle, seed, drop_last)
-        self.prev_num_replicas = prev_num_replicas
         self.prev_global_batch_size = prev_global_batch_size
         self.start_step = start_step
 
@@ -57,7 +55,7 @@ class AdaptrDistributedSampler(DistributedSampler):
         if self.start_step != 0:
             # remove indices that have already been used
             used_indices = []
-            for replica in range(self.prev_num_replicas):
+            for replica in range(self.num_replicas):
                 replica_indices = indices[replica : self.total_size : self.num_replicas]
                 used_indices.extend(
                     replica_indices[: self.start_step * self.prev_global_batch_size]
@@ -66,9 +64,17 @@ class AdaptrDistributedSampler(DistributedSampler):
             # Remove used indices. Due to drop_last, only remove the first occurence of used_index in indices.
             for used_index in used_indices:
                 indices.remove(used_index)
-
-            # Update total_size
-            total_size = len(indices)
+            # Update distributed sampler
+            self.num_replicas = torch.distributed.get_world_size()
+            self.rank = torch.distributed.get_rank()
+            super().__init__(
+                self.dataset,
+                self.num_replicas,
+                self.rank,
+                self.shuffle,
+                self.seed,
+                self.drop_last,
+            )
 
             # Update num_samples
             if self.drop_last and len(indices) % self.num_replicas != 0:  # type: ignore[arg-type]
@@ -80,6 +86,23 @@ class AdaptrDistributedSampler(DistributedSampler):
                 )
             else:
                 num_samples = math.ceil(len(indices) / self.num_replicas)  # type: ignore[arg-type]
+
+            # Update total_size
+            total_size = num_samples * self.num_replicas
+
+            if not self.drop_last:
+                # add extra samples to make it evenly divisible
+                padding_size = total_size - len(indices)
+                if padding_size <= len(indices):
+                    indices += indices[:padding_size]
+                else:
+                    indices += (indices * math.ceil(padding_size / len(indices)))[
+                        :padding_size
+                    ]
+            else:
+                # remove tail of data to make it evenly divisible.
+                indices = indices[:total_size]
+            assert len(indices) == total_size
 
         # subsample
         indices = indices[self.rank : total_size : self.num_replicas]

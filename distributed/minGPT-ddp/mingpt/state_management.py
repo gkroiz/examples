@@ -24,6 +24,7 @@ class AppState(Stateful):
         epoch=0,
         step=0,
         world_size=None,
+        global_rank=None,
         micro_batch_size=None,
         global_batch_size=None,
     ):
@@ -32,9 +33,11 @@ class AppState(Stateful):
         self.epoch = epoch
         self.step = step
         self.world_size = world_size
+        self.global_rank = global_rank
         self.micro_batch_size = micro_batch_size
         self.global_batch_size = global_batch_size
         self.prev_world_size = None
+        self.prev_global_rank = None
         self.prev_micro_batch_size = None
         self.prev_global_batch_size = None
 
@@ -57,6 +60,7 @@ class AppState(Stateful):
             "epoch": self.epoch,
             "step": self.step,
             "world_size": self.world_size,
+            "global_rank": self.global_rank,
             "micro_batch_size": self.micro_batch_size,
             "global_batch_size": self.global_batch_size,
         }
@@ -65,6 +69,7 @@ class AppState(Stateful):
         self.epoch = metadata["epoch"]
         self.step = metadata["step"]
         self.prev_world_size = metadata["world_size"]
+        self.prev_global_rank = metadata["global_rank"]
         self.prev_micro_batch_size = metadata["micro_batch_size"]
         self.prev_global_batch_size = metadata["global_batch_size"]
 

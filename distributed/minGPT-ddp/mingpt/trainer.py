@@ -56,8 +56,10 @@ class Trainer:
         optimizer=None,
         profiler=None,
         redis_client=None,
+        host_name: str = None,
     ):
         self.config = trainer_config
+        self.host_name = host_name
         # set torchrun variables
         self.global_rank = global_rank
         self.local_rank = self.global_rank % 8
@@ -75,6 +77,7 @@ class Trainer:
             model=model,
             optimizer=optimizer,
             world_size=world_size,
+            global_rank=global_rank,
             micro_batch_size=self.config.micro_batch_size,
             global_batch_size=self.config.global_batch_size,
         )
@@ -111,8 +114,7 @@ class Trainer:
         if torch.cuda.is_available():
             self.model = self.model.to(self.local_rank)
         if self.config.training_strategy == "ddp":
-            device_ids = [self.local_rank] if torch.cuda.is_available() else None
-            self.model = DDP(module=self.model, device_ids=device_ids)
+            self.model = DDP(module=self.model)
         elif self.config.training_strategy == "fsdp":
             self.model = FSDP(self.model)
         elif self.config.training_strategy == "hsdp":
@@ -125,7 +127,8 @@ class Trainer:
                 self.config.data_replica_size is not None
             ), "num_data_replicas must be set for HSDP"
             device_mesh = init_device_mesh(
-                self.config.num_data_replicas, self.config.data_replica_size
+                "cuda" if torch.cuda.is_available() else "cpu",
+                (self.config.num_data_replicas, self.config.data_replica_size),
             )
             self.model = FSDP(self.model, device_mesh=device_mesh)
         else:
@@ -140,6 +143,7 @@ class Trainer:
             self.train_dataset,
             self.app_state.step,
             self.app_state.prev_world_size,
+            self.app_state.prev_global_rank,
             self.app_state.prev_global_batch_size,
         )
         self.test_loader = (
@@ -156,6 +160,7 @@ class Trainer:
         dataset: Dataset,
         start_step=0,
         prev_world_size=None,
+        prev_global_rank=None,
         prev_global_batch_size=None,
     ):
         return DataLoader(
@@ -167,9 +172,12 @@ class Trainer:
             drop_last=False,
             sampler=AdaptrDistributedSampler(
                 dataset=dataset,
-                num_replicas=self.world_size,
-                prev_num_replicas=prev_world_size,
-                rank=self.global_rank,
+                num_replicas=prev_world_size
+                if (prev_world_size is not None)
+                else self.world_size,
+                rank=prev_global_rank
+                if (prev_global_rank is not None)
+                else self.global_rank,
                 drop_last=False,
                 start_step=start_step,
                 prev_global_batch_size=prev_global_batch_size,
@@ -177,7 +185,10 @@ class Trainer:
         )
 
     def _redis_save(self, state_dict, epoch, step):
-        checkpoint_key = f"ckpt_rank_{self.global_rank}"
+        if self.host_name is not None:
+            checkpoint_key = f"ckpt_host_{self.host_name}_localrank_{self.local_rank}"
+        else:
+            checkpoint_key = f"ckpt_localrank_{self.local_rank}"
         if self.redis_client.exists(checkpoint_key):
             self.redis_client.rename(checkpoint_key, checkpoint_key + "_backup")
 
@@ -234,7 +245,10 @@ class Trainer:
             raise ValueError("Invalid checkpoint method")
 
     def _redis_load(self):
-        checkpoint_key = f"ckpt_rank_{self.global_rank}"
+        if self.host_name is not None:
+            checkpoint_key = f"ckpt_host_{self.host_name}_localrank_{self.local_rank}"
+        else:
+            checkpoint_key = f"ckpt_localrank_{self.local_rank}"
         use_backup = torch.tensor(0)
         if self.redis_client.exists(checkpoint_key + "_backup"):
             print(f"Found checkpoint from redis {checkpoint_key}_backup")
@@ -368,8 +382,9 @@ class Trainer:
             ) % self.gradient_accumulation_steps != 0
 
             if self.config.debug and self.global_rank == 0:
+                step_type = "Train" if train else "Eval"
                 print(
-                    f"Epoch {epoch} | Step {step} | Iter {dataloader_iter} CPU RAM Used (GB): {psutil.virtual_memory()[3]/1000000000}"
+                    f"Epoch {epoch} | {step_type} Step {step} | Iter {dataloader_iter} CPU RAM Used (GB): {psutil.virtual_memory()[3]/1000000000}"
                 )
 
             step_type = "Train" if train else "Eval"
