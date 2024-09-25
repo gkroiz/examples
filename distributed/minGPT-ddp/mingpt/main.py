@@ -1,5 +1,7 @@
 import os
+import logging
 import socket
+
 import torch
 from torch.utils.data import random_split
 from torch.distributed import init_process_group, destroy_process_group
@@ -56,6 +58,7 @@ def train_process(
     redis_port: int,
     host_name: str = None,
 ):
+    logging.basicConfig(level=logging.INFO)
     redis_client = redis.Redis(host="localhost", port=redis_port, db=0)
     ddp_setup(global_rank, world_size)
 

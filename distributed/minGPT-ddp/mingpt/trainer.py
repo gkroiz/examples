@@ -12,6 +12,7 @@ from contextlib import nullcontext
 from datetime import datetime
 import pickle
 import psutil
+import logging
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -38,7 +39,8 @@ class TrainerConfig:
     use_amp: bool = None
     profile: bool = None
     ckpt_method: bool = None
-    debug: bool = None
+    debug_logs: bool = None
+    debug_memory_logs: bool = None
     training_strategy: str = None
     num_data_replicas: int = None
     data_replica_size: int = None
@@ -105,7 +107,7 @@ class Trainer:
         self.app_state.optimizer = optimizer
 
     def _deferred_init(self, model=None, optimizer=None):
-        start = time.time()
+        marker = time.time()
         if self.model is None:
             self.model = model
         if self.optimizer is None:
@@ -153,7 +155,7 @@ class Trainer:
         )
         # Once dataloaders are created, we can update app_state to reflect
         if self.global_rank == 0:
-            print(f"Deferred init took {time.time() - start:.2f}s")
+            logging.info(f"Deferred init took {time.time() - marker:.2f}s")
 
     def _prepare_dataloader(
         self,
@@ -218,7 +220,7 @@ class Trainer:
             curr_time = datetime.fromtimestamp(time.time()).strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
-            print(f"Starting async checkpoint at {curr_time}")
+            logging.info(f"Starting async checkpoint at {curr_time}")
         if self.config.ckpt_method is None:
             return
         elif self.config.ckpt_method == "torch":
@@ -229,7 +231,12 @@ class Trainer:
             )
         elif self.config.ckpt_method == "redis":
             # Offload the state_dict to CPU memory before serializing & saving
+            marker = time.time()
             state_dict = offload_state_dict_to_cpu(self.app_state.state_dict())
+            if self.config.debug_logs and self.global_rank == 0:
+                logging.info(
+                    f"Time taken to offload state_dict to CPU: {time.time() - marker:.2f}s"
+                )
             executor = ThreadPoolExecutor(max_workers=1)
             self.checkpoint_future = executor.submit(
                 self._redis_save,
@@ -251,12 +258,12 @@ class Trainer:
             checkpoint_key = f"ckpt_localrank_{self.local_rank}"
         use_backup = torch.tensor(0)
         if self.redis_client.exists(checkpoint_key + "_backup"):
-            print(f"Found checkpoint from redis {checkpoint_key}_backup")
+            logging.info(f"Found checkpoint from redis {checkpoint_key}_backup")
             use_backup += 1
         elif self.redis_client.exists(checkpoint_key):
-            print(f"Found checkpoint from redis {checkpoint_key}")
+            logging.info(f"Found checkpoint from redis {checkpoint_key}")
         else:
-            print("Checkpoint not found. Training model from scratch")
+            logging.info("Checkpoint not found. Training model from scratch")
             return
 
         # Check if any rank needs to use the backup
@@ -268,24 +275,34 @@ class Trainer:
                 use_backup.item() == self.world_size
             ), "Backup checkpoint exists on some ranks but not all"
 
-        print("Checkpointing key: ", checkpoint_key)
-
         # Load and unserialize the state_dict
+        timestamp = time.time()
         serialized_dict = self.redis_client.get(checkpoint_key)
+        if self.config.debug_logs and self.global_rank == 0:
+            logging.info(
+                f"Time taken to load checkpoint: {time.time() - timestamp:.2f}s"
+            )
+        timestamp = time.time()
         state_dict = pickle.loads(serialized_dict)
+        if self.config.debug_logs and self.global_rank == 0:
+            logging.info(
+                f"Time taken to deserialize checkpoint: {time.time() - timestamp:.2f}s"
+            )
+        timestamp = time.time()
+        # Update app_state with the loaded state_dict
         self.app_state.load_state_dict(state_dict)
-
-        # Update model and optimizer with the loaded state_dict
-        self.model.load_state_dict(state_dict["model"])
-        self.optimizer.load_state_dict(state_dict["optim"])
-        print(
+        if self.config.debug_logs and self.global_rank == 0:
+            logging.info(
+                f"Time taken to load state_dict: {time.time() - timestamp:.2f}s"
+            )
+        logging.info(
             f"Resuming training from checkpoint at epoch {self.app_state.epoch} step {self.app_state.step}"
         )
 
     def _load_checkpoint(self):
         # Find all files matching the pattern
         if self.config.ckpt_method is None:
-            print("Checkpointing is disabled. Training model from scratch")
+            logging.info("Checkpointing is disabled. Training model from scratch")
             return
         elif self.config.ckpt_method == "torch":
             checkpoint_files = glob.glob(f"{CHECKPOINT_DIR}ckpt_epoch*_step*")
@@ -307,15 +324,15 @@ class Trainer:
             latest_checkpoint = checkpoint_files[-1] if checkpoint_files else None
 
             if latest_checkpoint:
-                print(f"Loading checkpoint {latest_checkpoint}")
+                logging.info(f"Loading checkpoint {latest_checkpoint}")
 
                 dcp.load({"app": self.app_state}, checkpoint_id=latest_checkpoint)
 
             else:
-                print("Checkpoint not found. Training model from scratch")
+                logging.info("Checkpoint not found. Training model from scratch")
                 return
 
-            print(
+            logging.info(
                 f"Resuming training from checkpoint at epoch {self.app_state.epoch} step {self.app_state.step}"
             )
         elif self.config.ckpt_method == "redis":
@@ -371,7 +388,6 @@ class Trainer:
 
     def _run_epoch(self, epoch: int, dataloader: DataLoader, train: bool = True):
         dataloader.sampler.set_epoch(epoch)
-        start = time.time()
         step = self.step if train else 0
         step_loss = 0
         # Iterate through each batch in the dataloader
@@ -381,11 +397,19 @@ class Trainer:
                 dataloader_iter + 1
             ) % self.gradient_accumulation_steps != 0
 
-            if self.config.debug and self.global_rank == 0:
+            if self.config.debug_logs and self.global_rank == 0:
                 step_type = "Train" if train else "Eval"
-                print(
-                    f"Epoch {epoch} | {step_type} Step {step} | Iter {dataloader_iter} CPU RAM Used (GB): {psutil.virtual_memory()[3]/1000000000}"
+                curr_time = datetime.fromtimestamp(time.time()).strftime(
+                    "%Y-%m-%d %H:%M:%S"
                 )
+                if self.config.debug_memory_logs:
+                    logging.info(
+                        f"Epoch {epoch} | {step_type} Step {step} | Iter {dataloader_iter} | Time {curr_time} CPU RAM Used (GB): {psutil.virtual_memory()[3]/(1024 ** 3)}"
+                    )
+                else:
+                    logging.info(
+                        f"Epoch {epoch} | {step_type} Step {step} | Iter {dataloader_iter} | Time {curr_time}"
+                    )
 
             step_type = "Train" if train else "Eval"
             if torch.cuda.is_available():
@@ -396,13 +420,6 @@ class Trainer:
 
             if self.profiler:
                 self.profiler.step()
-
-            if step % 10 == 0 and not is_accumulating:
-                if self.global_rank == 0:
-                    print(
-                        f"[GPU{self.global_rank}] Epoch {epoch} | Step {step} | {step_type} Loss {step_loss:.5f} | Average Step Time {(time.time() - start)/100:.2f}s"
-                    )
-                start = time.time()
 
             # Check if you can checkpoint, increment step counters, and reset step_loss
             if not is_accumulating:
@@ -426,6 +443,8 @@ class Trainer:
         for epoch in range(int(self.epoch), self.config.max_epochs):
             self.epoch = epoch
             self._run_epoch(epoch, self.train_loader, train=True)
+            # Reset step count
+            self.step = 0
             # eval run
             if self.test_loader:
                 self._run_epoch(epoch, self.test_loader, train=False)

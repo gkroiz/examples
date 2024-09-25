@@ -16,7 +16,8 @@ trainer_config:
   use_amp: False # Only works with ddp
   profile: False
   ckpt_method: 'redis' # 'redis', 'torch', or None
-  debug: True
+  debug_logs: True
+  debug_memory_logs: False
   training_strategy: 'hsdp' # 'ddp', 'fsdp', or 'hsdp' are supported
   num_data_replicas: 4 # None or an integer. Only set to use HSDP
   data_replica_size: 8 # None or an integer. Only set to use HSDP
