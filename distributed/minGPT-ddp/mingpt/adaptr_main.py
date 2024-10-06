@@ -31,6 +31,9 @@ def custom_start_callback(
     """
     logging.info(f"{host.host_name}: Executing start callback")
 
+    # Set MASTER_ADDR environment variable
+    os.environ["MASTER_ADDR"] = command_metadata.master_addr
+
     for worker_info in host_info.workers:
         worker_name = worker_info.worker_name
         if worker_name in host.workers:
@@ -112,9 +115,7 @@ def main():
     # Define world_size
     world_size = int(os.environ["WORLD_SIZE"])
 
-    # Define torch address and port
-    if os.environ.get("MASTER_ADDR") is None:
-        os.environ["MASTER_ADDR"] = "localhost"
+    # Define torch port
     if os.environ.get("MASTER_PORT") is None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.bind(("", 0))
