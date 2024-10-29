@@ -14,25 +14,30 @@ from main import train_process
 from omegaconf import OmegaConf
 import adaptr_core
 
+logging.basicConfig(level=logging.INFO)
+
 
 def custom_start_callback(
     host: host.Host,
-    command_metadata: adaptr_core.CommandMetadata,
     host_info: adaptr_core.HostInfo,
     peer_host_info: adaptr_core.HostInfo,
+    master_addr: str,
+    new_world_size: int,
+    **kwargs,
 ):
     """Callback definition for GPU training start.
 
     Args:
         host (host.Host): Reference to the host.
-        command_metadata (adaptr_core.CommandMetadata): Metadata for the host's comamnd.
         host_info (adaptr_core.HostInfo): New host information for the host.
         peer_host_info (adaptr_core.WorkerInfo): New host information on a peer. This argument is not used for this callback.
+        master_addr (str): Master address for the training run.
+        new_world_size (int): New world size for the training run.
     """
     logging.info(f"{host.host_name}: Executing start callback")
 
     # Set MASTER_ADDR environment variable
-    os.environ["MASTER_ADDR"] = command_metadata.master_addr
+    os.environ["MASTER_ADDR"] = master_addr
 
     for worker_info in host_info.workers:
         worker_name = worker_info.worker_name
@@ -55,7 +60,7 @@ def custom_start_callback(
                 )
             old_num_data_replicas = cfg.trainer_config.num_data_replicas
             cfg.trainer_config.num_data_replicas = (
-                command_metadata.new_world_size // cfg.trainer_config.data_replica_size
+                new_world_size // cfg.trainer_config.data_replica_size
             )
             cfg.trainer_config.global_batch_size *= (
                 old_num_data_replicas // cfg.trainer_config.num_data_replicas
@@ -67,7 +72,7 @@ def custom_start_callback(
             # start training loop
             kwargs = {
                 "global_rank": worker.global_rank,
-                "world_size": command_metadata.new_world_size,
+                "world_size": new_world_size,
                 "cfg": cfg,
             }
             logging.info(
@@ -100,9 +105,6 @@ def start_worker(
 
 
 def main():
-    # Set up logging (optional, but recommended)
-    logging.basicConfig(level=logging.INFO)
-
     # Replace with your actual GCP project ID
     project_id = str(os.environ.get("PROJECT", "supercomputer-testing"))
 
